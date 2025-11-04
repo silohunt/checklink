@@ -20,45 +20,30 @@ checklink v0.4.3 is a POSIX-compliant shell script that surfaces obvious red fla
 
 ## Installation
 
-### Prerequisites
+### 1. Install dependencies
 
-Required:
-- `curl`, `jq`, `openssl`
-- [VirusTotal CLI](https://github.com/VirusTotal/vt-cli)
+Required: `curl`, `jq`, `openssl`
 
-Optional:
-- `whois` (for .gr domains)
-- `dig` (for DNS checks)
+Optional: `whois` (for .gr domains), `dig` (for DNS checks)
 
-### Quick Install
+### 2. Install VirusTotal CLI
 
-Install to ~/bin (no sudo required):
+Get a free API key at [virustotal.com](https://www.virustotal.com/), then:
+```bash
+# Install vt-cli: https://github.com/VirusTotal/vt-cli
+vt init YOUR_API_KEY
+```
+
+### 3. Install checklink
+
 ```bash
 mkdir -p ~/bin
 curl -L https://raw.githubusercontent.com/silohunt/checklink/main/checklink -o ~/bin/checklink && chmod +x ~/bin/checklink
 ```
 
-Make sure `~/bin` is in your PATH. Add to your `~/.bashrc` or `~/.zshrc` if needed:
+Add `~/bin` to PATH if needed (in `~/.bashrc` or `~/.zshrc`):
 ```bash
 export PATH="$HOME/bin:$PATH"
-```
-
-### Full Setup
-
-1. Install the VirusTotal CLI and configure your API key:
-```bash
-   vt init YOUR_API_KEY
-```
-
-2. Download the script:
-```bash
-   curl -O https://raw.githubusercontent.com/silohunt/checklink/main/checklink
-   chmod +x checklink
-```
-
-3. Move to system PATH (optional):
-```bash
-   sudo mv checklink /usr/local/bin/checklink
 ```
 
 ## Usage
@@ -84,7 +69,8 @@ checklink --no-age bit.ly/abc123
 ## How to Interpret Results
 
 - **Treat results as risk indicators only**
-- Clear red flags (VT "malicious," IP-literal hosts, very fresh cert on mature domain) warrant caution
+- Clear red flags (VT "malicious," IP-literal hosts) warrant caution
+- Multiple warnings together (e.g., fresh cert + URL shortener + new domain) suggest higher risk
 - "No detections" with warnings suggests verifying via another channel
 - If services are unavailable, treat output as incomplete, not as "safe"
 
