@@ -30,7 +30,20 @@ Optional:
 - `whois` (for .gr domains)
 - `dig` (for DNS checks)
 
-### Setup
+### Quick Install
+
+Install to ~/bin (no sudo required):
+```bash
+mkdir -p ~/bin
+curl -L https://raw.githubusercontent.com/silohunt/checklink/main/checklink -o ~/bin/checklink && chmod +x ~/bin/checklink
+```
+
+Make sure `~/bin` is in your PATH. Add to your `~/.bashrc` or `~/.zshrc` if needed:
+```bash
+export PATH="$HOME/bin:$PATH"
+```
+
+### Full Setup
 
 1. Install the VirusTotal CLI and configure your API key:
 ```bash
@@ -43,7 +56,7 @@ Optional:
    chmod +x checklink
 ```
 
-3. Optionally, move to PATH:
+3. Move to system PATH (optional):
 ```bash
    sudo mv checklink /usr/local/bin/checklink
 ```
