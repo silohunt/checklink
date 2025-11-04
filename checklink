@@ -1,0 +1,475 @@
+#!/bin/sh
+# -----------------------------------------------------------------------------
+# WARNING: This tool performs real network requests that may reveal investigated
+# URLs or hosts to third parties. Specifically:
+#
+# • Redirect resolution uses curl to contact the target server directly,
+#   revealing the queried URL to the destination and any intermediate redirectors.
+# • VirusTotal lookups and (optionally) uploads go through the public API and
+#   are logged by VirusTotal.
+# • DNS resolution uses your system’s configured resolver. After resolving an
+#   address, ASN ownership information is retrieved from ipinfo.io for each
+#   resolved IPv4 address.
+# • RDAP and WHOIS lookups are sent to registry or registrar servers and may be
+#   logged by those operators.
+#
+#
+# Use this tool with caution when investigating internal, private, or sensitive
+# URLs or infrastructure. It is intended for open-web triage and educational
+# use, not confidential analysis.
+# -----------------------------------------------------------------------------
+# checklink — URL Risk Indicator (v0.4.3 / POSIX sh)
+#
+# License: MIT
+#
+# Description:
+#   High-signal, minimal tool to assess URL risk indicators.
+#   - VirusTotal verdict (lookup-only by default; optional upload with -u)
+#   - Domain age (RDAP / .gr WHOIS) — printed as "Registration hint"
+#   - Certificate age & issuer, with "fresh cert" warnings
+#   - URL heuristics (scheme, subdomains, TLD, punycode, userinfo, IPv4 literal)
+#   - DNS resolution + ASN lookup (IPv4 only, via ipinfo.io)
+#
+# Dependencies:
+#   curl, jq, vt (VirusTotal CLI), openssl
+# Optional:
+#   whois (for .gr), dig (DNS)
+#
+# Environment:
+#   VT_ALLOW_UPLOAD=0   # privacy-first default. Set to 1 or use -u to upload.
+#
+# Usage:
+#   checklink [-q] [-u] [--no-age] [--version] <url-or-domain>
+#
+# Examples:
+#   checklink https://suspicious-site.com
+#   checklink -q domain.gr                # quiet mode, domain only
+#   checklink --no-age bit.ly/abc123      # skip age checks
+#   checklink -u suspicious-url.com       # upload new URL to VirusTotal
+# -----------------------------------------------------------------------------
+
+set -o nounset
+set -o pipefail 2>/dev/null || true  # some /bin/sh lack pipefail
+
+# ---------------- Config / constants ----------------
+VT_ALLOW_UPLOAD="${VT_ALLOW_UPLOAD:-0}"
+MAX_CURL_TIME=10
+WHOIS_TIMEOUT=5
+MAX_REDIRECTS=5
+MAX_URL_LEN=2048
+
+quiet=0
+do_age=1
+
+SHORTENERS="bit.ly t.co tinyurl.com is.gd cutt.ly short.link ow.ly buff.ly goo.gl rebrand.ly rb.gy trib.al shorturl.at linktr.ee"
+RISKY_TLDS="tk ml ga cf gq top click download zip mov"
+
+# ---------------- Output helper ----------------
+emit() { printf '%s\n' "$*"; }
+
+# ---------------- Small helpers ----------------
+get_scheme() {
+  printf '%s' "$1" | sed -n 's#^\([A-Za-z][A-Za-z0-9+.-]*\)://.*#\1#p'
+}
+get_host() {
+  # Simple authority → host (no IPv6 literal support by design)
+  s=$1
+  s=${s#*://}
+  s=${s%%/*}
+  s=${s%%\?*}
+  s=${s%%\#*}
+  h=${s%%:*}   # drop :port
+  printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
+}
+
+is_printable_and_sane() {
+  s="$1"
+  [ "${#s}" -le "$MAX_URL_LEN" ] || return 1
+  printf '%s' "$s" | LC_ALL=C grep -q '^[[:print:]]\+$' || return 1
+  return 0
+}
+has_allowed_scheme() { case "$1" in http://*|https://*) return 0;; *) return 1;; esac; }
+
+# Validate host for downstream tools (IPv4 or DNS name; no IPv6 literals)
+is_safe_host() {
+  h="$1"
+  # IPv4 literal
+  if printf '%s' "$h" | grep -q '^\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}$'; then
+    return 0
+  fi
+  # DNS hostname (labels letters/digits/hyphen)
+  if printf '%s' "$h" | grep -q '^[a-z0-9][a-z0-9-]*\(\.[a-z0-9][a-z0-9-]*\)\+$'; then
+    total_len=${#h}
+    [ "$total_len" -le 253 ] || return 1
+    oldIFS=$IFS; IFS=.
+    set -- $h
+    IFS=$oldIFS
+    for lbl in "$@"; do
+      len=${#lbl}
+      [ "$len" -ge 1 ] && [ "$len" -le 63 ] || return 1
+    done
+    return 0
+  fi
+  return 1
+}
+
+# Portable date parsing: BSD first (-j -f), GNU second (-d)
+parse_date_portable() {
+  date -j -f "%b %e %T %Y %Z" "$1" +%s 2>/dev/null || \
+  date -d "$1" +%s 2>/dev/null || \
+  echo 0
+}
+
+# VirusTotal JSON verdict normalizer
+verdict_from_stats() {
+  jq -r '
+    def S: .last_analysis_stats // .stats // empty;
+    def G: ( .data? // . ) | (if type=="array" then .[] else . end) | ( .attributes? // . );
+    ( [ G | S ][0] ) as $s
+    | if ($s|type) == "null" then "Unknown"
+      else
+        ($s.malicious // 0) as $m |
+        ($s.suspicious // 0) as $u |
+        if    $m > 0 then "Malicious (\($m))"
+        elif  $u > 0 then "Suspicious (\($u))"
+        elif  ($m==0 and $u==0) then "No detections"
+        else  "Unknown"
+        end
+      end
+  '
+}
+
+# ---------------- Heuristics (high value / low noise) ----------------
+has_userinfo() {
+  url="$1"
+  rest="${url#*://}"
+  [ "$rest" = "$url" ] && return 1
+  auth="${rest%%/*}"
+  auth="${auth%%\?*}"
+  auth="${auth%%#*}"
+  case "$auth" in *"@"*) return 0;; *) return 1;; esac
+}
+
+check_suspicious_patterns() {
+  url="$1"
+  scheme=$(get_scheme "$url")
+  host=$(get_host "$url")
+
+  [ -z "$host" ] && return 0
+
+  # 1) Non-HTTPS
+  [ -n "$scheme" ] && [ "$scheme" != "https" ] && emit "WARN:non_https:$scheme"
+
+  # 2) Userinfo in authority (user:pass@host)
+  if has_userinfo "$url"; then
+    emit "WARN:userinfo_present:yes"
+  fi
+
+  # 3) IP literal host (IPv4 only)
+  if printf '%s' "$host" | grep -q '^\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}$'; then
+    emit "WARN:ip_literal:$host"
+  fi
+
+  # 4) Punycode
+  case "$host" in *xn--*) emit "WARN:punycode:$host";; esac
+
+  # 5) Excessive subdomains: labels >= 5 ⇒ 3+ subdomains
+  oldIFS=$IFS; IFS=.
+  set -- $host
+  IFS=$oldIFS
+  nlabels=$#
+  [ "$nlabels" -ge 5 ] && emit "WARN:subdomain_count:$nlabels"
+
+  # 6) Known URL shorteners
+  for s in $SHORTENERS; do
+    [ "$host" = "$s" ] && { emit "WARN:url_shortener:$host"; break; }
+  done
+
+  # 7) Risky TLDs
+  tld="${host##*.}"
+  for r in $RISKY_TLDS; do
+    [ "$tld" = "$r" ] && { emit "WARN:risky_tld:$tld"; break; }
+  done
+
+  # 8) Double hyphen (ignore punycode)
+  case "$host" in
+    *"--"*)
+      case "$host" in *xn--*) : ;; *) emit "WARN:double_hyphen:$host";; esac
+    ;;
+  esac
+
+  # 9) Very long host
+  [ "${#host}" -gt 75 ] && emit "WARN:long_host:${#host}"
+}
+
+# ---------------- DNS + ASN (IPv4 only) ----------------
+get_asn_info() {
+  ip="$1"
+  curl -s --max-time 3 "https://ipinfo.io/${ip}/org" 2>/dev/null
+}
+
+dns_checks() {
+  host="$1"
+  command -v dig >/dev/null 2>&1 || return 0
+
+  a=$(dig +time=2 +tries=1 +short A "$host" 2>/dev/null | sed '/^;/d')
+
+  if [ -z "$a" ]; then
+    emit "WARN:nx_domain:yes"
+    return 0
+  fi
+
+  echo "$a" | while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    asn=$(get_asn_info "$rec")
+    if [ -n "$asn" ]; then emit "INFO:dns_a:$rec ($asn)"; else emit "INFO:dns_a:$rec"; fi
+    case "$rec" in
+      10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|127.*|169.254.*) emit "WARN:private_ip:$rec" ;;
+    esac
+  done
+}
+
+# ---------------- TLS certificate age + issuer ----------------
+tls_not_before() {
+  domain="$1"
+  cert_txt=$(echo | openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null \
+             | openssl x509 -noout -startdate -issuer 2>/dev/null)
+
+  start_line=$(printf '%s' "$cert_txt" | sed -n 's/^notBefore=//p' | head -1)
+  issuer=$(printf '%s' "$cert_txt" | sed -n 's/^issuer=//p' | head -1)
+
+  [ -z "$start_line" ] && return 1
+
+  start_epoch=$(parse_date_portable "$start_line")
+  if [ "$start_epoch" -gt 0 ] 2>/dev/null; then
+    now_epoch=$(date +%s)
+    days=$(( (now_epoch - start_epoch) / 86400 ))
+  else
+    days=""
+  fi
+
+  # Robust year extraction (portable)
+  year=$(
+    printf '%s\n' "$start_line" |
+      awk '{
+        for (i=1;i<=NF;i++) if ($i ~ /^(19|20)[0-9]{2}$/) { print $i; exit }
+      }'
+  )
+
+  if [ -n "$year" ]; then
+    age=$(( $(date +%Y) - year ))
+    if [ "$age" -eq 0 ] 2>/dev/null; then
+      emit "Certificate: <1 year old ($start_line) — issuer: $issuer"
+    else
+      emit "Certificate: ${age} years old ($start_line) — issuer: $issuer"
+    fi
+  else
+    emit "Certificate: ($start_line) — issuer: $issuer"
+  fi
+
+  # Fresh-cert warnings only if we could parse start date
+  if [ -n "${days:-}" ]; then
+    if [ "$days" -lt 2 ] 2>/dev/null; then
+      emit "WARN:very_fresh_cert:${days}d"
+    elif [ "$days" -lt 7 ] 2>/dev/null; then
+      if [ -n "${DOMAIN_AGE_YEARS:-}" ] && [ "$DOMAIN_AGE_YEARS" -ge 1 ] 2>/dev/null; then
+        emit "WARN:fresh_cert_mature_domain:${days}d"
+      fi
+    fi
+  fi
+}
+
+# ---------------- Domain age (RDAP / .gr WHOIS) ----------------
+domain_age_block() {
+  domain="$1"
+  tld=$(printf '%s' "$domain" | awk -F. '{print tolower($NF)}')
+
+  # .gr WHOIS first
+  if [ "$tld" = "gr" ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      whois_out=$(timeout "$WHOIS_TIMEOUT" whois -h grwhois.ics.forth.gr "$domain" 2>/dev/null || true)
+    elif command -v gtimeout >/dev/null 2>&1; then
+      whois_out=$(gtimeout "$WHOIS_TIMEOUT" whois -h grwhois.ics.forth.gr "$domain" 2>/dev/null || true)
+    else
+      whois_out=$(whois -h grwhois.ics.forth.gr "$domain" 2>/dev/null || true)
+    fi
+    creation_line=$(printf '%s' "$whois_out" \
+      | awk 'BEGIN{IGNORECASE=1}
+             /^(Registration Date|Created On|Creation Date|Registered On|Registered Date|Creation Time):/ {print; exit}' \
+      | tr -s " ")
+    if [ -n "$creation_line" ]; then
+      reg_year=$(
+        printf '%s\n' "$creation_line" |
+          awk '{
+            for (i=1;i<=NF;i++) if ($i ~ /^(19|20)[0-9]{2}$/) { print $i; exit }
+          }'
+      )
+      if [ -n "$reg_year" ]; then
+        age=$(( $(date +%Y) - reg_year ))
+        DOMAIN_AGE_YEARS="$age"; export DOMAIN_AGE_YEARS
+        emit "Registration hint: year=$reg_year; age=${age}y (WHOIS-gr)"
+      else
+        emit "Registration hint: unavailable (WHOIS-gr)"
+      fi
+      return 0
+    fi
+  fi
+
+  # RDAP (generic)
+  rdap_json=$(curl -sS --max-time "$MAX_CURL_TIME" -H 'User-Agent: Mozilla/5.0' "https://rdap.org/domain/${domain}" 2>/dev/null || true)
+  reg_date=$(printf '%s' "$rdap_json" | jq -r 'try (.events[]? | select(.eventAction=="registration") | .eventDate) catch ""' 2>/dev/null)
+  if [ -n "$reg_date" ] && [ "$reg_date" != "null" ]; then
+    reg_year=$(
+      printf '%s\n' "$reg_date" |
+        awk -F'T' '{print $1}' | awk -F'-' '{print $1}'
+    )
+    if [ -n "$reg_year" ]; then
+      age=$(( $(date +%Y) - reg_year ))
+      DOMAIN_AGE_YEARS="$age"; export DOMAIN_AGE_YEARS
+      emit "Registration hint: date=$reg_date; age=${age}y (RDAP)"
+    else
+      emit "Registration hint: date=$reg_date (RDAP)"
+    fi
+    return 0
+  fi
+
+  # Neither WHOIS nor RDAP yielded a registration date
+  emit "Registration hint: unavailable"
+  return 1
+}
+
+# ---------------- Arg parsing ----------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q) quiet=1; shift ;;
+    -u|--upload) VT_ALLOW_UPLOAD=1; shift ;;
+    --no-age) do_age=0; shift ;;
+    --version) emit "checklink v0.4.3"; exit 0 ;;
+    --) shift; break ;;
+    -*)
+      echo "Usage: checklink [-q] [-u] [--no-age] [--version] <url-or-domain>" >&2
+      exit 1
+      ;;
+    *) break ;;
+  esac
+done
+
+if [ $# -lt 1 ]; then
+  echo "Usage: checklink [-q] [-u] [--no-age] [--version] <url-or-domain>" >&2
+  exit 1
+fi
+
+input_raw="$1"
+
+# Normalize bare domains to https://domain/
+case "$input_raw" in
+  *://*) input_url="$input_raw" ;;
+  *)     input_url="https://$input_raw" ;;
+esac
+
+# Remove accidental backslashes before ?, =, &
+sanitized_url=$(printf '%s' "$input_url" | sed 's/\\\([?=&]\)/\1/g')
+
+# Validate input early
+if ! is_printable_and_sane "$input_raw"; then
+  echo "Error: input contains control chars or exceeds ${MAX_URL_LEN} bytes." >&2
+  exit 2
+fi
+if ! has_allowed_scheme "$sanitized_url"; then
+  echo "Error: only http(s) URLs are supported." >&2
+  exit 2
+fi
+
+# Explicitly reject IPv6 literal URLs (bracketed), by design
+case "$sanitized_url" in
+  *://\[*\]*)
+    echo "Error: IPv6 literal URLs are not supported — treat them as suspicious." >&2
+    exit 2
+    ;;
+esac
+
+host_check=$(get_host "$sanitized_url")
+if ! is_safe_host "$host_check"; then
+  echo "Error: invalid or unsafe host: $host_check" >&2
+  exit 2
+fi
+
+# ---------------- Resolve redirects (hardened) ----------------
+# capture HTTP code and final URL
+set -- $(curl -fsSL -g --path-as-is \
+   --max-time "$MAX_CURL_TIME" \
+   --max-redirs "$MAX_REDIRECTS" \
+   --proto '=https,http' \
+   --proto-redir '=https,http' \
+   -H 'User-Agent: Mozilla/5.0' \
+   -o /dev/null \
+   -w '%{http_code} %{url_effective}' \
+   "$sanitized_url")
+http_code="$1"
+final_url="$2"
+
+if [ -z "${final_url:-}" ]; then
+  emit "Summary: Unknown (unresolved)"
+  exit 2
+fi
+
+domain=$(get_host "$final_url")
+
+# Optional runtime notice when uploading (non-quiet mode)
+if [ "$VT_ALLOW_UPLOAD" -eq 1 ] && [ "$quiet" -eq 0 ]; then
+  emit "Note: uploading URL to VirusTotal for fresh analysis (may disclose the URL)."
+fi
+
+# ---------------- VirusTotal ----------------
+# Ensure vt CLI exists
+command -v vt >/dev/null 2>&1 || {
+  echo "Error: vt CLI not found. Install: https://github.com/VirusTotal/vt-cli" >&2
+  exit 1
+}
+
+url_for_vt="$final_url"
+case "$http_code" in
+  4*|5*) url_for_vt="$sanitized_url" ;;
+esac
+
+vt_lookup=$(vt url "$url_for_vt" --format json 2>/dev/null || true)
+vt_verdict=""
+if [ -n "$vt_lookup" ]; then
+  vt_verdict=$(printf '%s' "$vt_lookup" | verdict_from_stats 2>/dev/null || true)
+fi
+
+if [ -z "$vt_verdict" ] || [ "$vt_verdict" = "Unknown" ]; then
+  if [ "$VT_ALLOW_UPLOAD" -eq 1 ]; then
+    vt_scan=$(vt scan url "$url_for_vt" --wait --format json 2>/dev/null || true)
+    if [ -n "$vt_scan" ]; then
+      vt_verdict=$(printf '%s' "$vt_scan" | verdict_from_stats 2>/dev/null || true)
+    fi
+    [ -z "$vt_verdict" ] && vt_verdict="Unavailable"
+  else
+    vt_verdict="No report (not uploaded)"
+  fi
+fi
+
+# ---------------- Domain & cert ages ----------------
+reg_line=""
+cert_line=""
+if [ "$do_age" -eq 1 ] && [ -n "$domain" ]; then
+  reg_line=$(domain_age_block "$domain" || true)
+  cert_line=$(tls_not_before "$domain" || true)
+fi
+
+# ---------------- Heuristics & DNS ----------------
+warnings_text=$( (check_suspicious_patterns "$final_url"; dns_checks "$domain") | sed '/^$/d' )
+
+# ---------------- Output ----------------
+if [ "$quiet" -eq 1 ]; then
+  emit "Summary: $vt_verdict | $final_url"
+  [ -n "$warnings_text" ] && emit "$warnings_text"
+  exit 0
+fi
+
+emit "URL:    $final_url (HTTP $http_code)"
+emit "VT:     $vt_verdict"
+[ -n "$reg_line" ] && emit "$reg_line" || emit "Registration hint: unavailable"
+[ -n "$cert_line" ] && emit "$cert_line"
+[ -n "$warnings_text" ] && emit "$warnings_text"
