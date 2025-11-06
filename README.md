@@ -8,15 +8,16 @@ This tool performs real network requests that may reveal investigated URLs to th
 
 ## Overview
 
-checklink v0.4.3 is a POSIX-compliant shell script that surfaces obvious red flags in URLs. It is **not** a comprehensive security tool but rather a quick first-pass checker that provides context to help you decide whether a link looks suspicious.
+checklink v0.5.0 is a POSIX-compliant shell script that surfaces obvious red flags in URLs. It is **not** a comprehensive security tool but rather a quick first-pass checker that provides context to help you decide whether a link looks suspicious.
 
 ## Features
 
 - VirusTotal verdict (lookup-only by default)
-- Domain registration age (RDAP / .gr WHOIS)
-- Certificate age and issuer analysis
-- URL heuristics (scheme, subdomains, TLD, punycode, userinfo, IP literals)
-- DNS resolution with ASN lookup
+- Domain registration age (RDAP with registrar referrals / .gr WHOIS)
+- TLS certificate validation (age, issuer, name mismatch detection)
+- URL heuristics (scheme, subdomains, TLD, punycode, userinfo, IP literals, length)
+- DNS resolution with ASN lookup (IPv4)
+- Input vs final URL tracking (shows both when redirects occur)
 
 ## Installation
 
