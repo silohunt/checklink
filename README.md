@@ -8,7 +8,7 @@ This tool performs real network requests that may reveal investigated URLs to th
 
 ## Overview
 
-checklink v0.5.0 is a POSIX-compliant shell script that surfaces obvious red flags in URLs. It is **not** a comprehensive security tool but rather a quick first-pass checker that provides context to help you decide whether a link looks suspicious.
+checklink v0.5.1 is a POSIX-compliant shell script that surfaces obvious red flags in URLs. It is **not** a comprehensive security tool but rather a quick first-pass checker that provides context to help you decide whether a link looks suspicious.
 
 ## Features
 
@@ -74,6 +74,15 @@ checklink --no-age bit.ly/abc123
 - Multiple warnings together (e.g., fresh cert + URL shortener + new domain) suggest higher risk
 - "No detections" with warnings suggests verifying via another channel
 - If services are unavailable, treat output as incomplete, not as "safe"
+
+**Note:** Registration age is computed for the original input domain, while TLS/DNS/HTTP checks reflect the final destination after redirects.
+
+**Exit codes:**
+- 0 – No warnings or detections
+- 1 – Missing dependency or runtime failure
+- 2 – Invalid input or resolver error
+- 3 – One or more WARN lines
+- 4 – VirusTotal: Malicious / Suspicious verdict
 
 ## Limitations
 

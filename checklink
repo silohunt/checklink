@@ -18,7 +18,7 @@
 # URLs or infrastructure. It is intended for open-web triage and educational
 # use, not confidential analysis.
 # -----------------------------------------------------------------------------
-# checklink — URL Risk Indicator (v0.5.0 / POSIX sh)
+# checklink — URL Risk Indicator (v0.5.1 / POSIX sh)
 #
 # License: MIT
 #
@@ -49,6 +49,7 @@
 # -----------------------------------------------------------------------------
 
 set -o nounset
+# shellcheck disable=SC3040
 set -o pipefail 2>/dev/null || true  # some /bin/sh lack pipefail
 
 # ---------------- Dependency checks ----------------
@@ -126,6 +127,7 @@ is_safe_host() {
     total_len=${#h}
     [ "$total_len" -le 253 ] || return 1
     oldIFS=$IFS; IFS=.
+    # shellcheck disable=SC2086
     set -- $h
     IFS=$oldIFS
     for lbl in "$@"; do
@@ -199,6 +201,7 @@ check_suspicious_patterns() {
 
   # 5) Excessive subdomains: labels >= 5 ⇒ 3+ subdomains
   oldIFS=$IFS; IFS=.
+  # shellcheck disable=SC2086
   set -- $host
   IFS=$oldIFS
   nlabels=$#
@@ -239,7 +242,7 @@ dns_checks() {
   host="$1"
   command -v dig >/dev/null 2>&1 || return 0
 
-  a=$(dig +time=2 +tries=1 +short A "$host" 2>/dev/null | sed '/^;/d')
+  a=$(dig +time=2 +tries=1 +short A "$host" 2>/dev/null | sed '/^;/d' | sort -u)
 
   if [ -z "$a" ]; then
     emit "WARN:nx_domain:yes"
@@ -333,11 +336,17 @@ tls_warnings() {
   fi
 
   if [ -n "$sans" ]; then
-    echo "$sans" | while IFS= read -r name; do
+    matched=0
+    while IFS= read -r name; do
       [ -z "$name" ] && continue
-      _cert_host_matches "$host" "$name" && exit 10
-    done
-    [ $? -eq 10 ] || emit "WARN:cert_name_mismatch:$host"
+      if _cert_host_matches "$host" "$name"; then
+        matched=1
+        break
+      fi
+    done <<EOF
+$sans
+EOF
+    [ "$matched" -eq 0 ] && emit "WARN:cert_name_mismatch:$host"
   fi
 }
 
@@ -461,7 +470,7 @@ while [ $# -gt 0 ]; do
     -q) quiet=1; shift ;;
     -u|--upload) VT_ALLOW_UPLOAD=1; shift ;;
     --no-age) do_age=0; shift ;;
-    --version) emit "checklink v0.5.0"; exit 0 ;;
+    --version) emit "checklink v0.5.1"; exit 0 ;;
     --) shift; break ;;
     -*)
       echo "Usage: checklink [-q] [-u] [--no-age] [--version] <url-or-domain>" >&2
@@ -513,6 +522,7 @@ fi
 
 # ---------------- Resolve redirects (hardened) ----------------
 # capture HTTP code and final URL
+# shellcheck disable=SC2046
 set -- $(curl -fsSL -g --path-as-is \
    --max-time "$MAX_CURL_TIME" \
    --max-redirs "$MAX_REDIRECTS" \
@@ -569,7 +579,6 @@ if [ -z "$vt_verdict" ] || [ "$vt_verdict" = "Unknown" ]; then
 fi
 
 # ---------------- Domain age & cert fetch ----------------
-reg_line=""
 input_reg_line=""
 if [ "$do_age" -eq 1 ]; then
   [ -n "$input_domain" ] && input_reg_line=$(domain_age_block "$input_domain" || true)
@@ -583,7 +592,15 @@ warnings_text=$( (check_suspicious_patterns "$final_url"; dns_checks "$final_dom
 if [ "$quiet" -eq 1 ]; then
   emit "Summary: $vt_verdict | $final_url"
   [ -n "$warnings_text" ] && emit "$warnings_text"
-  exit 0
+
+  # Exit codes: 0=clean, 3=warnings, 4=malicious/suspicious
+  exit_code=0
+  if printf '%s' "$vt_verdict" | grep -qE "Malicious|Suspicious"; then
+    exit_code=4
+  elif printf '%s' "$warnings_text" | grep -q "^WARN:"; then
+    exit_code=3
+  fi
+  exit "$exit_code"
 fi
 
 # Show input vs final if they differ
@@ -605,11 +622,28 @@ if [ "$do_age" -eq 1 ]; then
     else
       emit "Registration (input): unavailable"
     fi
-    tls_cert_info && : || emit "Certificate (final): unavailable"
+    if ! tls_cert_info; then
+      emit "Certificate (final): unavailable"
+    fi
   else
-    [ -n "$input_reg_line" ] && emit "$input_reg_line" || emit "Registration hint: unavailable"
-    tls_cert_info || emit "Certificate: unavailable"
+    if [ -n "$input_reg_line" ]; then
+      emit "$input_reg_line"
+    else
+      emit "Registration hint: unavailable"
+    fi
+    if ! tls_cert_info; then
+      emit "Certificate: unavailable"
+    fi
   fi
 fi
 
 [ -n "$warnings_text" ] && emit "$warnings_text"
+
+# Exit codes: 0=clean, 3=warnings, 4=malicious/suspicious
+exit_code=0
+if printf '%s' "$vt_verdict" | grep -qE "Malicious|Suspicious"; then
+  exit_code=4
+elif printf '%s' "$warnings_text" | grep -q "^WARN:"; then
+  exit_code=3
+fi
+exit "$exit_code"
