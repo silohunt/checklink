@@ -18,7 +18,7 @@
 # URLs or infrastructure. It is intended for open-web triage and educational
 # use, not confidential analysis.
 # -----------------------------------------------------------------------------
-# checklink — URL Risk Indicator (v0.4.3 / POSIX sh)
+# checklink — URL Risk Indicator (v0.5.0 / POSIX sh)
 #
 # License: MIT
 #
@@ -51,6 +51,14 @@
 set -o nounset
 set -o pipefail 2>/dev/null || true  # some /bin/sh lack pipefail
 
+# ---------------- Dependency checks ----------------
+for dep in curl jq openssl; do
+  command -v "$dep" >/dev/null 2>&1 || {
+    echo "Error: $dep is required but not installed." >&2
+    exit 1
+  }
+done
+
 # ---------------- Config / constants ----------------
 VT_ALLOW_UPLOAD="${VT_ALLOW_UPLOAD:-0}"
 MAX_CURL_TIME=10
@@ -80,6 +88,22 @@ get_host() {
   s=${s%%\#*}
   h=${s%%:*}   # drop :port
   printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
+}
+
+# Extract registered domain (eTLD+1) for RDAP/WHOIS
+# Pragmatic heuristic: assumes standard TLDs (.com, .org, etc.) and common ccTLDs
+get_registered_domain() {
+  fqdn="$1"
+  # Handle known 2-level TLDs (co.uk, com.au, etc.)
+  case "$fqdn" in
+    *.co.uk|*.com.au|*.co.jp|*.co.nz|*.co.za|*.com.br|*.com.mx|*.com.ar)
+      printf '%s' "$fqdn" | awk -F. '{if(NF>=3) print $(NF-2)"."$(NF-1)"."$NF; else print $0}'
+      ;;
+    *)
+      # Standard TLD: take last 2 labels
+      printf '%s' "$fqdn" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF; else print $0}'
+      ;;
+  esac
 }
 
 is_printable_and_sane() {
@@ -200,6 +224,9 @@ check_suspicious_patterns() {
 
   # 9) Very long host
   [ "${#host}" -gt 75 ] && emit "WARN:long_host:${#host}"
+
+  # 10) Very long URL (often obfuscated phishing)
+  [ "${#url}" -gt 200 ] && emit "WARN:long_url:${#url}"
 }
 
 # ---------------- DNS + ASN (IPv4 only) ----------------
@@ -221,6 +248,8 @@ dns_checks() {
 
   echo "$a" | while IFS= read -r rec; do
     [ -z "$rec" ] && continue
+    # Skip CNAMEs (not IPv4 addresses)
+    printf '%s' "$rec" | grep -q '^\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}$' || continue
     asn=$(get_asn_info "$rec")
     if [ -n "$asn" ]; then emit "INFO:dns_a:$rec ($asn)"; else emit "INFO:dns_a:$rec"; fi
     case "$rec" in
@@ -229,69 +258,115 @@ dns_checks() {
   done
 }
 
-# ---------------- TLS certificate age + issuer ----------------
-tls_not_before() {
-  domain="$1"
-  cert_txt=$(echo | openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null \
-             | openssl x509 -noout -startdate -issuer 2>/dev/null)
+# ---------------- TLS certificate inspection ----------------
+# Single-label wildcard match: *.example.com matches foo.example.com only
+_cert_host_matches() {
+  host="$1"; name="$2"
 
-  start_line=$(printf '%s' "$cert_txt" | sed -n 's/^notBefore=//p' | head -1)
-  issuer=$(printf '%s' "$cert_txt" | sed -n 's/^issuer=//p' | head -1)
+  [ "$host" = "$name" ] && return 0
 
-  [ -z "$start_line" ] && return 1
+  case "$name" in
+    '*.'*)
+      suf="${name#*.}"
+      case "$host" in
+        *."$suf")
+          h_labels=$(printf '%s' "$host" | awk -F'.' '{print NF}')
+          s_labels=$(printf '%s' "$suf"  | awk -F'.' '{print NF}')
+          [ "$h_labels" -eq $((s_labels + 1)) ] && return 0
+        ;;
+      esac
+    ;;
+  esac
 
-  start_epoch=$(parse_date_portable "$start_line")
-  if [ "$start_epoch" -gt 0 ] 2>/dev/null; then
-    now_epoch=$(date +%s)
-    days=$(( (now_epoch - start_epoch) / 86400 ))
-  else
-    days=""
-  fi
+  return 1
+}
 
-  # Robust year extraction (portable)
-  year=$(
-    printf '%s\n' "$start_line" |
-      awk '{
-        for (i=1;i<=NF;i++) if ($i ~ /^(19|20)[0-9]{2}$/) { print $i; exit }
-      }'
-  )
+# Fetch cert and cache in CERT_DATA for use by both functions
+_cert_fetch() {
+  host="$1"; port="${2:-443}"
+  CERT_DATA=$(echo | openssl s_client -servername "$host" -connect "$host:$port" 2>/dev/null \
+              | openssl x509 -noout -text -subject -startdate -issuer 2>/dev/null) || CERT_DATA=""
+  export CERT_DATA
+}
 
-  if [ -n "$year" ]; then
-    age=$(( $(date +%Y) - year ))
-    if [ "$age" -eq 0 ] 2>/dev/null; then
-      emit "Certificate: <1 year old ($start_line) — issuer: $issuer"
-    else
-      emit "Certificate: ${age} years old ($start_line) — issuer: $issuer"
-    fi
-  else
-    emit "Certificate: ($start_line) — issuer: $issuer"
-  fi
+# Emit TLS-related warnings (called with other heuristics)
+tls_warnings() {
+  host="$1"
+  [ -z "${CERT_DATA:-}" ] && return 0
 
-  # Fresh-cert warnings only if we could parse start date
-  if [ -n "${days:-}" ]; then
-    if [ "$days" -lt 2 ] 2>/dev/null; then
-      emit "WARN:very_fresh_cert:${days}d"
-    elif [ "$days" -lt 7 ] 2>/dev/null; then
-      if [ -n "${DOMAIN_AGE_YEARS:-}" ] && [ "$DOMAIN_AGE_YEARS" -ge 1 ] 2>/dev/null; then
-        emit "WARN:fresh_cert_mature_domain:${days}d"
+  start_line=$(printf '%s\n' "$CERT_DATA" | sed -n 's/^notBefore=//p' | head -1)
+
+  if [ -n "$start_line" ]; then
+    # Fresh-cert warnings
+    start_epoch=$(parse_date_portable "$start_line")
+    if [ "$start_epoch" -gt 0 ] 2>/dev/null; then
+      now_epoch=$(date +%s)
+      days=$(( (now_epoch - start_epoch) / 86400 ))
+
+      if [ "$days" -lt 2 ] 2>/dev/null; then
+        emit "WARN:very_fresh_cert:${days}d"
+      elif [ "$days" -lt 7 ] 2>/dev/null; then
+        [ -n "${DOMAIN_AGE_YEARS:-}" ] && [ "$DOMAIN_AGE_YEARS" -ge 1 ] 2>/dev/null && \
+          emit "WARN:fresh_cert_mature_domain:${days}d"
       fi
     fi
   fi
+
+  # Check hostname matches certificate (SANs or CN)
+  sans=$(
+    printf '%s\n' "$CERT_DATA" |
+    awk '
+      /Subject Alternative Name/ {in_san=1; next}
+      /X509v3/ {in_san=0}
+      in_san {print}
+    ' |
+    tr ',' '\n' |
+    sed -n 's/^[[:space:]]*DNS:[[:space:]]*//p' |
+    tr '[:upper:]' '[:lower:]'
+  )
+
+  if [ -z "$sans" ]; then
+    cn=$(printf '%s\n' "$CERT_DATA" \
+         | sed -n 's/^subject=.*CN=\([^,/]*\).*/\1/p' \
+         | tr '[:upper:]' '[:lower:]' | head -1)
+    [ -n "$cn" ] && sans="$cn"
+  fi
+
+  if [ -n "$sans" ]; then
+    echo "$sans" | while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      _cert_host_matches "$host" "$name" && exit 10
+    done
+    [ $? -eq 10 ] || emit "WARN:cert_name_mismatch:$host"
+  fi
+}
+
+# Print cert info line (called separately for display)
+tls_cert_info() {
+  [ -z "${CERT_DATA:-}" ] && return 1
+
+  start_line=$(printf '%s\n' "$CERT_DATA" | sed -n 's/^notBefore=//p' | head -1)
+  issuer=$(printf '%s\n' "$CERT_DATA" | sed -n 's/^issuer=//p' | head -1)
+
+  emit "Certificate: $start_line — issuer: $issuer"
 }
 
 # ---------------- Domain age (RDAP / .gr WHOIS) ----------------
 domain_age_block() {
   domain="$1"
-  tld=$(printf '%s' "$domain" | awk -F. '{print tolower($NF)}')
+  # Normalize to registered domain (eTLD+1) for RDAP/WHOIS
+  reg_domain=$(get_registered_domain "$domain")
+  tld=$(printf '%s' "$reg_domain" | awk -F. '{print tolower($NF)}')
 
-  # .gr WHOIS first
+  # .gr WHOIS first (RDAP unreliable for .gr)
   if [ "$tld" = "gr" ]; then
     if command -v timeout >/dev/null 2>&1; then
-      whois_out=$(timeout "$WHOIS_TIMEOUT" whois -h grwhois.ics.forth.gr "$domain" 2>/dev/null || true)
+      whois_out=$(timeout "$WHOIS_TIMEOUT" whois -h grwhois.ics.forth.gr "$reg_domain" 2>/dev/null || true)
     elif command -v gtimeout >/dev/null 2>&1; then
-      whois_out=$(gtimeout "$WHOIS_TIMEOUT" whois -h grwhois.ics.forth.gr "$domain" 2>/dev/null || true)
+      whois_out=$(gtimeout "$WHOIS_TIMEOUT" whois -h grwhois.ics.forth.gr "$reg_domain" 2>/dev/null || true)
     else
-      whois_out=$(whois -h grwhois.ics.forth.gr "$domain" 2>/dev/null || true)
+      # No timeout available, skip WHOIS to avoid hangs
+      whois_out=""
     fi
     creation_line=$(printf '%s' "$whois_out" \
       | awk 'BEGIN{IGNORECASE=1}
@@ -315,9 +390,51 @@ domain_age_block() {
     fi
   fi
 
-  # RDAP (generic)
-  rdap_json=$(curl -sS --max-time "$MAX_CURL_TIME" -H 'User-Agent: Mozilla/5.0' "https://rdap.org/domain/${domain}" 2>/dev/null || true)
-  reg_date=$(printf '%s' "$rdap_json" | jq -r 'try (.events[]? | select(.eventAction=="registration") | .eventDate) catch ""' 2>/dev/null)
+  # RDAP (generic) - follow redirects and (if needed) one registrar referral
+  rdap_json=$(
+    curl -sSL --max-time "$MAX_CURL_TIME" \
+         -H 'User-Agent: Mozilla/5.0' \
+         -H 'Accept: application/rdap+json, application/json;q=0.9, */*;q=0.1' \
+         "https://rdap.org/domain/${reg_domain}" 2>/dev/null || true
+  )
+
+  # Try registry-provided registration event
+  reg_date=$(printf '%s' "$rdap_json" |
+    jq -r 'try (.events[]? | select(.eventAction=="registration") | .eventDate) catch ""' 2>/dev/null)
+
+  if [ -z "$reg_date" ] || [ "$reg_date" = "null" ]; then
+    # Find canonical "self" to avoid loops
+    self_url=$(printf '%s' "$rdap_json" |
+      jq -r '.links[]? | select(.rel=="self") | .href' 2>/dev/null | head -1)
+
+    # Prefer registrar entity links if available
+    ref_url=$(printf '%s' "$rdap_json" |
+      jq -r '
+        # first try registrar entity links
+        ( .entities[]? | select(.roles[]?=="registrar") | .links[]? | .href? ) // empty
+      ' 2>/dev/null | head -1)
+
+    # Fallback to any related/authoritative link that looks like a domain RDAP URL
+    if [ -z "$ref_url" ] || [ "$ref_url" = "null" ]; then
+      ref_url=$(printf '%s' "$rdap_json" |
+        jq -r '
+          .links[]? | select((.rel=="related" or .rel=="authoritative" or .rel=="authority" or .rel=="alternate") and (.href?)) | .href
+        ' 2>/dev/null | grep '/domain/' | head -1)
+    fi
+
+    # Follow one referral if it exists and is not the same as self
+    if [ -n "$ref_url" ] && [ "$ref_url" != "null" ] && [ "$ref_url" != "$self_url" ]; then
+      rdap_ref=$(
+        curl -sSL --max-time "$MAX_CURL_TIME" \
+             -H 'User-Agent: Mozilla/5.0' \
+             -H 'Accept: application/rdap+json, application/json;q=0.9, */*;q=0.1' \
+             "$ref_url" 2>/dev/null || true
+      )
+      reg_date=$(printf '%s' "$rdap_ref" |
+        jq -r 'try (.events[]? | select(.eventAction=="registration") | .eventDate) catch ""' 2>/dev/null)
+    fi
+  fi
+
   if [ -n "$reg_date" ] && [ "$reg_date" != "null" ]; then
     reg_year=$(
       printf '%s\n' "$reg_date" |
@@ -344,7 +461,7 @@ while [ $# -gt 0 ]; do
     -q) quiet=1; shift ;;
     -u|--upload) VT_ALLOW_UPLOAD=1; shift ;;
     --no-age) do_age=0; shift ;;
-    --version) emit "checklink v0.4.3"; exit 0 ;;
+    --version) emit "checklink v0.5.0"; exit 0 ;;
     --) shift; break ;;
     -*)
       echo "Usage: checklink [-q] [-u] [--no-age] [--version] <url-or-domain>" >&2
@@ -413,7 +530,8 @@ if [ -z "${final_url:-}" ]; then
   exit 2
 fi
 
-domain=$(get_host "$final_url")
+input_domain=$(get_host "$sanitized_url")
+final_domain=$(get_host "$final_url")
 
 # Optional runtime notice when uploading (non-quiet mode)
 if [ "$VT_ALLOW_UPLOAD" -eq 1 ] && [ "$quiet" -eq 0 ]; then
@@ -450,16 +568,16 @@ if [ -z "$vt_verdict" ] || [ "$vt_verdict" = "Unknown" ]; then
   fi
 fi
 
-# ---------------- Domain & cert ages ----------------
+# ---------------- Domain age & cert fetch ----------------
 reg_line=""
-cert_line=""
-if [ "$do_age" -eq 1 ] && [ -n "$domain" ]; then
-  reg_line=$(domain_age_block "$domain" || true)
-  cert_line=$(tls_not_before "$domain" || true)
+input_reg_line=""
+if [ "$do_age" -eq 1 ]; then
+  [ -n "$input_domain" ] && input_reg_line=$(domain_age_block "$input_domain" || true)
+  [ -n "$final_domain" ] && _cert_fetch "$final_domain"
 fi
 
-# ---------------- Heuristics & DNS ----------------
-warnings_text=$( (check_suspicious_patterns "$final_url"; dns_checks "$domain") | sed '/^$/d' )
+# ---------------- Heuristics & DNS & TLS warnings ----------------
+warnings_text=$( (check_suspicious_patterns "$final_url"; dns_checks "$final_domain"; tls_warnings "$final_domain") | sed '/^$/d' )
 
 # ---------------- Output ----------------
 if [ "$quiet" -eq 1 ]; then
@@ -468,8 +586,30 @@ if [ "$quiet" -eq 1 ]; then
   exit 0
 fi
 
-emit "URL:    $final_url (HTTP $http_code)"
+# Show input vs final if they differ
+if [ "$input_domain" != "$final_domain" ]; then
+  emit "Input:  $sanitized_url"
+  emit "Final:  $final_url (HTTP $http_code)"
+else
+  emit "URL:    $final_url (HTTP $http_code)"
+fi
+
 emit "VT:     $vt_verdict"
-[ -n "$reg_line" ] && emit "$reg_line" || emit "Registration hint: unavailable"
-[ -n "$cert_line" ] && emit "$cert_line"
+
+if [ "$do_age" -eq 1 ]; then
+  if [ "$input_domain" != "$final_domain" ]; then
+    # Strip "Registration hint:" prefix and add our own label
+    if [ -n "$input_reg_line" ]; then
+      clean_reg=$(printf '%s' "$input_reg_line" | sed 's/^Registration hint: //')
+      emit "Registration (input): $clean_reg"
+    else
+      emit "Registration (input): unavailable"
+    fi
+    tls_cert_info && : || emit "Certificate (final): unavailable"
+  else
+    [ -n "$input_reg_line" ] && emit "$input_reg_line" || emit "Registration hint: unavailable"
+    tls_cert_info || emit "Certificate: unavailable"
+  fi
+fi
+
 [ -n "$warnings_text" ] && emit "$warnings_text"

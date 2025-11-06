@@ -36,3 +36,6 @@
 # Temporary files
 *.tmp
 *.bak
+
+# Claude Code
+CLAUDE.md
